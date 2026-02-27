@@ -23,6 +23,7 @@ venv/
 .vscode/
 .idea/
 .claude/
+.spec-workflow/
 *.swp
 *.swo
 
