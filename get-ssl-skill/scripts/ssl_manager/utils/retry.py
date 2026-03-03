@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Callable, TypeVar
 
-from aliyun_ssl_manager.utils.logger import log
+from ssl_manager.utils.logger import log
 
 T = TypeVar("T")
 

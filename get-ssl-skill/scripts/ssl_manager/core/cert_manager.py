@@ -10,10 +10,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aliyun_ssl_manager.api.cas_client import CasClient
-from aliyun_ssl_manager.api.dns_client import DnsClient
-from aliyun_ssl_manager.models import AppConfig
-from aliyun_ssl_manager.utils.logger import log
+from ssl_manager.api.cas_client import CasClient
+from ssl_manager.api.dns_client import DnsClient
+from ssl_manager.models import AppConfig, safe_dirname
+from ssl_manager.utils.logger import log
 
 
 def _parse_cert_time(raw_time) -> datetime | None:
@@ -86,7 +86,7 @@ class CertManager:
             print(f"    Directory: {self._config.acme.directory_url}")
             print(f"    Email: {self._config.acme.email}")
             print(f"    Account key: {self._config.acme.account_key_path}")
-            from aliyun_ssl_manager.api.acme_client import AcmeClient
+            from ssl_manager.api.acme_client import AcmeClient
             acme = AcmeClient(self._config.acme)
             result = acme.check_connectivity()
             if result["ok"]:
@@ -116,7 +116,7 @@ class CertManager:
         Returns:
             True if local cert was found and displayed, False otherwise.
         """
-        cert_file = Path(self._config.cert_storage_dir) / domain / "fullchain.pem"
+        cert_file = Path(self._config.cert_storage_dir) / safe_dirname(domain) / "fullchain.pem"
         if not cert_file.exists():
             return False
 
@@ -227,25 +227,50 @@ class CertManager:
         print("  Certificate Apply Plan (DRY RUN)")
         print("=" * 60)
         print(f"\n  Domain: {dc.domain}")
+        if dc.san:
+            print(f"  SAN:    {', '.join(dc.san)}")
         print(f"  Mode: ACME (Let's Encrypt via {self._config.acme.directory_url})")
         print(f"\n  Steps:")
         print(f"    [1/6] Register/load ACME account")
-        print(f"    [2/6] Create ACME order + get dns-01 challenge")
-        print(f"    [3/6] Add TXT DNS validation record (Aliyun DNS)")
-        print(f"    [4/6] Answer ACME challenge")
+        print(f"    [2/6] Create ACME order + get dns-01 challenge(s)")
+        print(f"    [3/6] Add TXT DNS validation record(s) (Aliyun DNS)")
+        print(f"    [4/6] Answer ACME challenge(s)")
         print(f"    [5/6] Poll ACME order until valid (up to {self._config.options.poll_timeout}s)")
         print(f"    [6/6] Finalize + download cert + cleanup DNS")
-        print(f"\n  Storage: {self._config.cert_storage_dir}/{dc.domain}/")
+        print(f"\n  Storage: {self._config.cert_storage_dir}/{safe_dirname(dc.domain)}/")
         print("=" * 60)
 
+    def _resolve_challenge_type(self, domain: str) -> str:
+        """Determine challenge type for a domain.
+
+        Priority: domain-level override > global ACME config default.
+        """
+        dc = self._config.get_domain(domain)
+        if dc and dc.challenge_type:
+            return dc.challenge_type
+        return self._config.acme.challenge_type
+
     def _execute_apply(self, domain: str) -> dict | None:
-        """Execute the 6-step ACME certificate application flow.
+        """Route to the appropriate apply flow based on challenge type."""
+        challenge_type = self._resolve_challenge_type(domain)
+        if challenge_type == "dns-persist-01":
+            return self._execute_apply_persist(domain)
+        return self._execute_apply_dns01(domain)
+
+    def _execute_apply_dns01(self, domain: str) -> dict | None:
+        """Execute the 6-step ACME dns-01 certificate application flow.
+
+        Supports wildcard domains and SAN lists. Multiple authorizations
+        are handled by iterating all dns-01 challenges.
 
         Returns:
             dict with cert/key paths if successful, None on failure.
         """
-        from aliyun_ssl_manager.api.acme_client import AcmeClient
-        from aliyun_ssl_manager.core.validator import DnsValidator
+        from ssl_manager.api.acme_client import AcmeClient
+        from ssl_manager.core.validator import DnsValidator
+
+        dc = self._config.get_domain(domain)
+        san = dc.san if dc else []
 
         acme = AcmeClient(self._config.acme)
         log.set_total_steps(6)
@@ -259,40 +284,46 @@ class CertManager:
             log.error(f"ACME account registration failed: {e!r}")
             return None
 
-        # [2/6] Create order + get dns-01 challenge
-        log.step("Creating ACME order and getting dns-01 challenge")
+        # [2/6] Create order + get dns-01 challenges
+        log.step("Creating ACME order and getting dns-01 challenge(s)")
         try:
-            order, challenge_info = acme.request_certificate(domain)
-            record_name = challenge_info["record_name"]
-            validation = challenge_info["validation"]
-            log.success(
-                f"dns-01 challenge: {record_name} TXT = {validation[:32]}..."
-            )
+            order, challenge_list = acme.request_certificate(domain, san=san or None)
+            for ci in challenge_list:
+                log.success(
+                    f"dns-01 challenge: {ci['record_name']} "
+                    f"TXT = {ci['validation'][:32]}..."
+                )
         except Exception as e:
             log.error(f"ACME order failed: {e!r}")
             return None
 
-        # [3/6] Add DNS TXT record via Aliyun DNS
-        log.step("Adding DNS validation record via Aliyun DNS")
+        # [3/6] Add DNS TXT record(s) via Aliyun DNS
+        log.step("Adding DNS validation record(s) via Aliyun DNS")
         validator = DnsValidator(self._dns)
+        dns_records: list[tuple[str, str]] = []  # (root_domain, rr) for cleanup
         try:
-            root_domain, rr = validator.parse_record_domain(record_name, domain)
-            record_id = validator.add_validation_record(
-                root_domain=root_domain,
-                rr=rr,
-                record_type="TXT",
-                value=validation,
-            )
-            log.success(f"DNS record added (id={record_id})")
+            for ci in challenge_list:
+                root_domain, rr = validator.parse_record_domain(
+                    ci["record_name"], ci["domain"]
+                )
+                validator.add_validation_record(
+                    root_domain=root_domain,
+                    rr=rr,
+                    record_type="TXT",
+                    value=ci["validation"],
+                )
+                dns_records.append((root_domain, rr))
+                log.success(f"DNS record added: {rr}.{root_domain}")
         except Exception as e:
             log.error(f"Failed to add DNS record: {e}")
             return None
 
-        # [4/6] Answer ACME challenge
-        log.step("Answering ACME challenge")
+        # [4/6] Answer ACME challenges
+        log.step("Answering ACME challenge(s)")
         try:
-            acme.answer_challenge(challenge_info["challenge_body"])
-            log.success("Challenge answered, ACME server will verify DNS")
+            for ci in challenge_list:
+                acme.answer_challenge(ci["challenge_body"])
+            log.success("All challenges answered, ACME server will verify DNS")
         except Exception as e:
             log.error(f"Failed to answer challenge: {e}")
             return None
@@ -322,7 +353,7 @@ class CertManager:
         # [6/6] Save certificate + cleanup DNS
         log.step("Saving certificate and cleaning up DNS")
         try:
-            cert_dir = Path(self._config.cert_storage_dir) / domain
+            cert_dir = Path(self._config.cert_storage_dir) / safe_dirname(domain)
             cert_dir.mkdir(parents=True, exist_ok=True)
 
             cert_path = cert_dir / "fullchain.pem"
@@ -332,10 +363,12 @@ class CertManager:
             key_path.write_text(private_key_pem, encoding="utf-8")
             log.success(f"Certificate saved to {cert_dir}")
 
-            try:
-                validator.cleanup(root_domain, rr, "TXT")
-            except Exception as e:
-                log.warn(f"DNS cleanup failed (non-critical): {e}")
+            # Cleanup all DNS validation records
+            for root_domain, rr in dns_records:
+                try:
+                    validator.cleanup(root_domain, rr, "TXT")
+                except Exception as e:
+                    log.warn(f"DNS cleanup failed for {rr}.{root_domain} (non-critical): {e}")
 
             return {
                 "cert_path": str(cert_path),
@@ -346,6 +379,173 @@ class CertManager:
         except Exception as e:
             log.error(f"Failed to save certificate: {e}")
             return None
+
+    def _execute_apply_persist(self, domain: str) -> dict | None:
+        """Execute simplified ACME flow using dns-persist-01.
+
+        Assumes persistent DNS record is already in place (via ``setup_persist``).
+        Steps: register → create order → answer challenge → poll+save
+
+        Returns:
+            dict with cert/key paths if successful, None on failure.
+        """
+        from ssl_manager.api.acme_client import AcmeClient
+
+        dc = self._config.get_domain(domain)
+        san = dc.san if dc else []
+
+        acme = AcmeClient(self._config.acme)
+        log.set_total_steps(4)
+
+        # [1/4] Register ACME account
+        log.step("Registering/loading ACME account")
+        try:
+            acme.register_or_load()
+            log.success(f"ACME account ready ({self._config.acme.directory_url})")
+        except Exception as e:
+            log.error(f"ACME account registration failed: {e!r}")
+            return None
+
+        # [2/4] Create order + find challenges (prefer dns-persist-01)
+        log.step("Creating ACME order (dns-persist-01 mode)")
+        try:
+            order, challenge_list = acme.request_certificate(domain, san=san or None)
+            # Re-discover with persist preference
+            challenge_list = acme.find_challenges(order, preferred_type="dns-persist-01")
+            for ci in challenge_list:
+                ctype = ci.get("_type", "dns-01")
+                log.success(f"Challenge ({ctype}) found for {ci['domain']}")
+        except Exception as e:
+            log.error(f"ACME order failed: {e!r}")
+            return None
+
+        # [3/4] Answer challenges (no DNS modification needed for persist)
+        log.step("Answering challenge(s) (persistent record already in DNS)")
+        try:
+            for ci in challenge_list:
+                if ci.get("_type") == "dns-persist-01":
+                    acme.answer_persist_challenge(ci["challenge_body"])
+                else:
+                    acme.answer_challenge(ci["challenge_body"])
+            log.success("All challenges answered")
+        except Exception as e:
+            log.error(f"Failed to answer challenge: {e}")
+            return None
+
+        # [4/4] Poll + finalize + save
+        log.step(
+            f"Polling ACME order and finalizing (timeout={self._config.options.poll_timeout}s)"
+        )
+        try:
+            fullchain_pem, private_key_pem = acme.poll_and_finalize(
+                order, timeout=self._config.options.poll_timeout
+            )
+            log.success("Certificate issued by Let's Encrypt!")
+        except TimeoutError:
+            log.error(
+                f"Timed out after {self._config.options.poll_timeout}s. "
+                "Persistent DNS record may be incorrect. Check with diagnose."
+            )
+            return None
+        except RuntimeError as e:
+            log.error(str(e))
+            return None
+        except Exception as e:
+            log.error(f"ACME finalization failed: {e!r}")
+            return None
+
+        # Save certificate
+        try:
+            cert_dir = Path(self._config.cert_storage_dir) / safe_dirname(domain)
+            cert_dir.mkdir(parents=True, exist_ok=True)
+
+            cert_path = cert_dir / "fullchain.pem"
+            key_path = cert_dir / "privkey.pem"
+
+            cert_path.write_text(fullchain_pem, encoding="utf-8")
+            key_path.write_text(private_key_pem, encoding="utf-8")
+            log.success(f"Certificate saved to {cert_dir}")
+
+            return {
+                "cert_path": str(cert_path),
+                "key_path": str(key_path),
+                "domain": domain,
+            }
+        except Exception as e:
+            log.error(f"Failed to save certificate: {e}")
+            return None
+
+    # ── setup-persist ─────────────────────────────────────────
+
+    def setup_persist(
+        self,
+        domain: str,
+        *,
+        policy: str | None = None,
+        persist_until: int | None = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Set up a persistent DNS validation record for dns-persist-01.
+
+        This needs to be done once per domain. After setup, all future
+        renewals using dns-persist-01 will skip DNS modification.
+
+        Args:
+            domain: Target domain (may be wildcard).
+            policy: Optional policy (e.g. ``"wildcard"``).
+            persist_until: Optional UNIX timestamp for record expiry.
+            dry_run: If True, show what would be done.
+        """
+        if not self._config.acme.enabled:
+            log.error("ACME is not enabled! Set acme.enabled=true in config.yaml")
+            return
+
+        from ssl_manager.api.acme_client import AcmeClient
+        from ssl_manager.core.validator import PersistValidator
+
+        acme = AcmeClient(self._config.acme)
+
+        # Register to get account URI
+        try:
+            acme.register_or_load()
+        except Exception as e:
+            log.error(f"ACME account registration failed: {e!r}")
+            return
+
+        account_uri = acme.get_account_uri()
+        pv = PersistValidator(self._dns)
+        root_domain, rr = pv.get_record_domain(domain)
+        value = pv.build_record_value(
+            self._config.acme.directory_url,
+            account_uri,
+            policy=policy,
+            persist_until=persist_until,
+        )
+
+        if dry_run:
+            print("=" * 60)
+            print("  DNS-PERSIST-01 Setup Plan (DRY RUN)")
+            print("=" * 60)
+            print(f"\n  Domain:  {domain}")
+            print(f"  Record:  {rr}.{root_domain}")
+            print(f"  Type:    TXT")
+            print(f"  Value:   {value}")
+            if policy:
+                print(f"  Policy:  {policy}")
+            if persist_until:
+                print(f"  Persist until: {persist_until}")
+            print(f"\n  Account URI: {account_uri}")
+            print("=" * 60)
+            return
+
+        pv.setup_persist_record(
+            domain,
+            self._config.acme.directory_url,
+            account_uri,
+            policy=policy,
+            persist_until=persist_until,
+        )
+        log.success(f"Persistent DNS record set up for {domain}")
 
     # ── deploy ───────────────────────────────────────────────────
 
@@ -358,7 +558,7 @@ class CertManager:
             log.error(f"Domain '{domain}' not found in config")
             return
 
-        cert_dir = Path(self._config.cert_storage_dir) / domain
+        cert_dir = Path(self._config.cert_storage_dir) / safe_dirname(domain)
         cert_path = cert_dir / "fullchain.pem"
         key_path = cert_dir / "privkey.pem"
 
@@ -401,7 +601,7 @@ class CertManager:
 
     def _execute_deploy(self, domain, servers, cert_path, key_path) -> None:
         """Execute deployment to all target servers."""
-        from aliyun_ssl_manager.core.deployer import Deployer
+        from ssl_manager.core.deployer import Deployer
 
         deployer = Deployer(backup=self._config.options.backup_old_cert)
         success_count = 0
@@ -454,8 +654,8 @@ class CertManager:
                     self._show_apply_plan(dc)
                     self._show_deploy_plan(
                         d, dc.servers,
-                        Path(self._config.cert_storage_dir) / d / "fullchain.pem",
-                        Path(self._config.cert_storage_dir) / d / "privkey.pem",
+                        Path(self._config.cert_storage_dir) / safe_dirname(d) / "fullchain.pem",
+                        Path(self._config.cert_storage_dir) / safe_dirname(d) / "privkey.pem",
                     )
             return
 
@@ -479,7 +679,7 @@ class CertManager:
 
         Checks local certificate files first, then falls back to CAS records.
         """
-        cert_file = Path(self._config.cert_storage_dir) / domain / "fullchain.pem"
+        cert_file = Path(self._config.cert_storage_dir) / safe_dirname(domain) / "fullchain.pem"
         if cert_file.exists():
             try:
                 from cryptography import x509 as cx509
@@ -522,19 +722,20 @@ class CertManager:
     # ── diagnose ─────────────────────────────────────────────────
 
     def diagnose(self) -> None:
-        """Diagnose ACME connectivity and Aliyun API status."""
+        """Diagnose ACME connectivity, challenge config, and Aliyun API status."""
         print("=" * 60)
         print("  SSL Certificate Diagnostic Report")
         print("=" * 60)
 
-        # Phase 1: ACME status
-        print("\n  [1/3] ACME (Let's Encrypt) status...")
+        # Phase 1: ACME status + challenge type
+        print("\n  [1/4] ACME (Let's Encrypt) status...")
         if self._config.acme.enabled:
             print(f"    ENABLED")
             print(f"    Directory: {self._config.acme.directory_url}")
             print(f"    Email: {self._config.acme.email}")
             print(f"    Account key: {self._config.acme.account_key_path}")
-            from aliyun_ssl_manager.api.acme_client import AcmeClient
+            print(f"    Challenge type (global): {self._config.acme.challenge_type}")
+            from ssl_manager.api.acme_client import AcmeClient
             acme = AcmeClient(self._config.acme)
             conn = acme.check_connectivity()
             if conn["ok"]:
@@ -546,8 +747,27 @@ class CertManager:
         else:
             print(f"    DISABLED (set acme.enabled=true in config.yaml to enable)")
 
-        # Phase 2: Aliyun API connectivity (read-only)
-        print("\n  [2/3] Testing Aliyun API connectivity...")
+        # Phase 2: Per-domain challenge type + persist record status
+        print("\n  [2/4] Domain challenge configuration...")
+        from ssl_manager.core.validator import PersistValidator
+        pv = PersistValidator(self._dns)
+        for dc in self._config.domains:
+            ctype = self._resolve_challenge_type(dc.domain)
+            san_info = f" + SAN: {', '.join(dc.san)}" if dc.san else ""
+            print(f"    {dc.domain}{san_info}")
+            print(f"      Challenge type: {ctype}")
+            if ctype == "dns-persist-01":
+                records = pv.check_persist_record(dc.domain)
+                if records:
+                    print(f"      Persist record: FOUND ({len(records)} record(s))")
+                    for r in records[:2]:
+                        val = r.get("Value", r.get("value", "?"))
+                        print(f"        TXT = {val[:60]}...")
+                else:
+                    print(f"      Persist record: NOT FOUND - run 'setup-persist --domain {dc.domain}'")
+
+        # Phase 3: Aliyun API connectivity (read-only)
+        print("\n  [3/4] Testing Aliyun API connectivity...")
         try:
             certs = self._cas.list_user_certificates()
             print(f"    CAS API: OK - found {len(certs)} certificate record(s)")
@@ -560,12 +780,15 @@ class CertManager:
         except Exception as e:
             print(f"    CAS API: FAILED - {e}")
 
-        # Phase 3: Recommendations
-        print("\n  [3/3] Recommendations:")
+        # Phase 4: Recommendations
+        print("\n  [4/4] Recommendations:")
         if self._config.acme.enabled:
             print(f"\n    ACME mode is ACTIVE")
             print(f"    Certificates will be issued by Let's Encrypt.")
             print(f"    DNS validation via Aliyun DNS API.")
+            if self._config.acme.challenge_type == "dns-persist-01":
+                print(f"    dns-persist-01 is the default challenge type.")
+                print(f"    Make sure to run 'setup-persist' for each domain first.")
         else:
             print(f"\n    ACME is DISABLED!")
             print(f"    Enable it in config.yaml:")

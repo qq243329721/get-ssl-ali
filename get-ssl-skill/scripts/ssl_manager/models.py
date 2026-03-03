@@ -5,6 +5,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# ---------------------------------------------------------------------------
+# Wildcard domain helpers
+# ---------------------------------------------------------------------------
+
+def safe_dirname(domain: str) -> str:
+    """Convert domain to a filesystem-safe directory name.
+
+    ``*.example.com`` -> ``_wildcard.example.com``
+    """
+    return domain.replace("*", "_wildcard")
+
+
+def is_wildcard(domain: str) -> bool:
+    """Return True if *domain* is a wildcard (e.g. ``*.example.com``)."""
+    return domain.startswith("*.")
+
+
+def strip_wildcard(domain: str) -> str:
+    """Strip the wildcard prefix: ``*.example.com`` -> ``example.com``."""
+    return domain[2:] if is_wildcard(domain) else domain
+
+
 @dataclass
 class ServerConfig:
     """Single server deployment target."""
@@ -24,6 +46,8 @@ class DomainConfig:
 
     domain: str
     servers: list[ServerConfig] = field(default_factory=list)
+    san: list[str] = field(default_factory=list)
+    challenge_type: str | None = None  # per-domain override ("dns-01" | "dns-persist-01")
 
 
 @dataclass
@@ -53,6 +77,7 @@ class AcmeConfig:
     directory_url: str = "https://acme-v02.api.letsencrypt.org/directory"
     email: str = ""
     account_key_path: str = "./certs/acme_account.key"
+    challenge_type: str = "dns-01"  # global default: "dns-01" | "dns-persist-01"
 
 
 @dataclass

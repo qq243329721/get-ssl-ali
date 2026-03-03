@@ -6,8 +6,8 @@ from alibabacloud_alidns20150109 import client as dns_client_module
 from alibabacloud_alidns20150109 import models as dns_models
 from alibabacloud_tea_openapi import models as openapi_models
 
-from aliyun_ssl_manager.models import AliyunCredential
-from aliyun_ssl_manager.utils.logger import log
+from ssl_manager.models import AliyunCredential
+from ssl_manager.utils.logger import log
 
 
 class DnsClient:

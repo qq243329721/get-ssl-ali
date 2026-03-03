@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from aliyun_ssl_manager.models import (
+from ssl_manager.models import (
     AcmeConfig,
     AliyunCredential,
     AppConfig,
@@ -71,7 +71,7 @@ def _find_config_file(config_path: str | None = None) -> Path:
         return p
 
     # Search in multiple base dirs: cwd first, then skill root (relative to package)
-    # __file__ -> aliyun_ssl_manager -> scripts -> get-ssl-ali (3 levels)
+    # __file__ -> ssl_manager -> scripts -> get-ssl-ali (3 levels)
     pkg_project_dir = Path(__file__).resolve().parent.parent.parent
     search_bases = [Path.cwd(), pkg_project_dir]
 
@@ -133,7 +133,12 @@ def load_config(config_path: str | None = None) -> AppConfig:
                     ),
                 )
             )
-        domains.append(DomainConfig(domain=d["domain"], servers=servers))
+        domains.append(DomainConfig(
+            domain=d["domain"],
+            servers=servers,
+            san=d.get("san", []),
+            challenge_type=d.get("challenge_type"),
+        ))
 
     # Build options
     opts_raw = data.get("options", {})
@@ -157,6 +162,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         email=acme_raw.get("email", ""),
         account_key_path=acme_key_path,
+        challenge_type=acme_raw.get("challenge_type", "dns-01"),
     )
 
     return AppConfig(

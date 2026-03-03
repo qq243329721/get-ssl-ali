@@ -12,8 +12,10 @@ acme:
   directory_url: "https://acme-v02.api.letsencrypt.org/directory"
   email: "${ACME_EMAIL}"
   account_key_path: "./certs/acme_account.key"
+  challenge_type: "dns-01"           # "dns-01" | "dns-persist-01"
 
 domains:
+  # Single domain example
   - domain: "example.com"
     servers:
       - host: "192.168.1.10"
@@ -24,6 +26,7 @@ domains:
         key_path: "/etc/nginx/ssl/example.com/privkey.pem"
         reload_cmd: "nginx -t && systemctl reload nginx"
 
+  # Subdomain example
   - domain: "api.example.com"
     servers:
       - host: "192.168.1.20"
@@ -33,6 +36,21 @@ domains:
         cert_path: "/etc/nginx/ssl/api.example.com/fullchain.pem"
         key_path: "/etc/nginx/ssl/api.example.com/privkey.pem"
         reload_cmd: "nginx -t && systemctl reload nginx"
+
+  # Wildcard + root domain (SAN) example
+  # One cert covers *.example.com AND example.com
+  # - domain: "*.example.com"
+  #   san:
+  #     - "example.com"              # also cover the bare domain
+  #   challenge_type: "dns-persist-01"  # per-domain override
+  #   servers:
+  #     - host: "192.168.1.10"
+  #       port: 22
+  #       user: "root"
+  #       password: "${SSH_PASS_SERVER1}"
+  #       cert_path: "/etc/nginx/ssl/example.com/fullchain.pem"
+  #       key_path: "/etc/nginx/ssl/example.com/privkey.pem"
+  #       reload_cmd: "nginx -t && systemctl reload nginx"
 
 options:
   poll_interval: 10         # DNS validation polling interval (seconds)

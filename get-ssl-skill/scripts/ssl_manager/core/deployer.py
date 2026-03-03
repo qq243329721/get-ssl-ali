@@ -7,8 +7,8 @@ from pathlib import PurePosixPath
 
 import paramiko
 
-from aliyun_ssl_manager.models import ServerConfig
-from aliyun_ssl_manager.utils.logger import log
+from ssl_manager.models import ServerConfig
+from ssl_manager.utils.logger import log
 
 
 class Deployer:

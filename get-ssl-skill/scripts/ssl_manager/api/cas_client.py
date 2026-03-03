@@ -10,7 +10,7 @@ from alibabacloud_cas20200407 import client as cas_client_module
 from alibabacloud_cas20200407 import models as cas_models
 from alibabacloud_tea_openapi import models as openapi_models
 
-from aliyun_ssl_manager.models import AliyunCredential
+from ssl_manager.models import AliyunCredential
 
 
 class CasClient:
