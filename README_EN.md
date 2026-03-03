@@ -1,4 +1,4 @@
-# Aliyun SSL Manager
+# HTTPS SSL Manager
 
 SSL certificate automation using ACME (Let's Encrypt) + Alibaba Cloud DNS. Designed as an Agent Skill.
 
