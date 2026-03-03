@@ -1,5 +1,8 @@
 # 阿里云 SSL 证书管理
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+
 基于 ACME (Let's Encrypt) + 阿里云 DNS 的 SSL 证书自动化工具，可作为 Claude/OpenCode/OpenClaw Skill 使用。
 
 ## 作为 Agent Skill 使用
